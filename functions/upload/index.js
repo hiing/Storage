@@ -2,10 +2,11 @@ import { createS3Client } from '../utils/storage/s3Client.js';
 import { userAuthCheck, UnauthorizedResponse } from "../utils/auth/userAuth";
 import { fetchUploadConfig, fetchSecurityConfig, fetchPageConfig } from "../utils/sysConfig";
 import {
-    createResponse, getUploadIp, getIPAddress, resolveFileExt,
+    createResponse, createUploadResponse, checkUploadFormat, getUploadIp, getIPAddress, resolveFileExt,
     moderateContent, purgeCDNCache, isBlockedUploadIp, buildUniqueFileId, endUpload, getImageDimensions,
     sanitizeUploadFolder
 } from "./uploadTools";
+import { getFileTypeCategory, normalizeMimeType, resolveFileType } from "../utils/mimeTypes.js";
 import { initializeChunkedUpload, handleChunkUpload, uploadLargeFileToTelegram, handleCleanupRequest } from "./chunkUpload";
 import { handleChunkMerge } from "./chunkMerge";
 import { TelegramAPI } from "../utils/storage/telegramAPI";
@@ -14,6 +15,7 @@ import { HuggingFaceAPI } from "../utils/storage/huggingfaceAPI";
 import { WebDAVAPI } from "../utils/storage/webdavAPI";
 import { PutObjectCommand } from "@aws-sdk/client-s3";
 import { getDatabase } from '../utils/databaseAdapter.js';
+import { resolveUploadExpiry } from '../utils/fileExpiryService.js';
 
 
 export async function onRequest(context) {  // Contents of context object
@@ -55,6 +57,11 @@ export async function onRequest(context) {  // Contents of context object
     // 检查是否为初始化分块上传请求
     const initChunked = url.searchParams.get('initChunked') === 'true';
     if (initChunked) {
+        // 分块上传在开始前校验有效期参数，避免传完所有分块才在合并时被拒绝
+        const expiry = await resolveUploadExpiry(context);
+        if (expiry.error) {
+            return createResponse(expiry.error, { status: 400 });
+        }
         return await initializeChunkedUpload(context);
     }
 
@@ -134,8 +141,13 @@ async function processFileUpload(context, formdata = null) {
     // 获取文件信息
     const time = new Date().getTime();
     const file = formdata.get('file');
-    const fileType = file.type;
     let fileName = file.name;
+    const formatError = checkUploadFormat(fileName, context.uploadConfig);
+    if (formatError) return formatError;
+    // 部分客户端（同步工具、脚本）不提供有效的 Content-Type，按扩展名兜底推断。
+    // 否则图片会被记成 application/octet-stream，导致随机图类型过滤、尺寸提取、
+    // 图片处理校验全部失效。
+    const fileType = resolveFileType(fileName, file.type);
     const fileSizeBytes = file.size; // 文件大小，单位字节
     const fileSize = (fileSizeBytes / 1024 / 1024).toFixed(2); // 文件大小，单位MB
 
@@ -146,7 +158,7 @@ async function processFileUpload(context, formdata = null) {
 
     // 提取图片尺寸
     let imageDimensions = null;
-    if (fileType.startsWith('image/')) {
+    if (getFileTypeCategory(fileType) === 'image') {
         try {
             // 统一读取 64KB，足以覆盖 JPEG 的 EXIF 数据和其他格式
             const headerBuffer = await file.slice(0, 65536).arrayBuffer();
@@ -185,6 +197,16 @@ async function processFileUpload(context, formdata = null) {
     if (imageDimensions) {
         metadata.Width = imageDimensions.width;
         metadata.Height = imageDimensions.height;
+    }
+
+    // 文件有效期由后端按设置决定
+    const expiry = await resolveUploadExpiry(context);
+    if (expiry.error) {
+        return createResponse(expiry.error, { status: 400 });
+    }
+    if (expiry.expiresAt) {
+        metadata.ExpiresAt = expiry.expiresAt;
+        context.fileExpiresAt = expiry.expiresAt;
     }
 
     const fileExt = resolveFileExt(fileName, fileType);
@@ -278,11 +300,10 @@ function buildUploadResponse(context, returnLink) {
     if (context.publicUrl) {
         result.publicUrl = context.publicUrl;
     }
-    return createResponse(JSON.stringify([result]), {
-        headers: {
-            'Content-Type': 'application/json',
-        },
-    });
+    if (context.fileExpiresAt) {
+        result.expiresAt = context.fileExpiresAt;
+    }
+    return createUploadResponse(context, [result]);
 }
 
 // 上传到Cloudflare R2
@@ -313,7 +334,9 @@ async function uploadFileToCloudflareR2(context, fullId, metadata, returnLink) {
     const R2DataBase = env.img_r2;
 
     // 写入R2数据库
-    await R2DataBase.put(fullId, formdata.get('file'));
+    await R2DataBase.put(fullId, formdata.get('file'), {
+        httpMetadata: { contentType: metadata.FileType },
+    });
 
     // 更新metadata
     metadata.Channel = "CloudflareR2";
@@ -387,7 +410,7 @@ async function uploadFileToS3(context, fullId, metadata, returnLink) {
             Bucket: bucketName,
             Key: s3FileName,
             Body: uint8Array, // 直接使用 Blob
-            ContentType: file.type
+            ContentType: metadata.FileType
         };
 
         // 执行上传
@@ -468,11 +491,11 @@ async function uploadFileToTelegram(context, fullId, metadata, fileExt, fileName
 
     // 由于TG会把gif后缀的文件转为视频，所以需要修改后缀名绕过限制
     if (fileExt === 'gif') {
-        const newFileName = fileName.replace(/\.gif$/, '.jpeg');
+        const newFileName = fileName.replace(/\.gif$/i, '.jpeg');
         const newFile = new File([formdata.get('file')], newFileName, { type: fileType });
         formdata.set('file', newFile);
     } else if (fileExt === 'webp') {
-        const newFileName = fileName.replace(/\.webp$/, '.jpeg');
+        const newFileName = fileName.replace(/\.webp$/i, '.jpeg');
         const newFile = new File([formdata.get('file')], newFileName, { type: fileType });
         formdata.set('file', newFile);
     }
@@ -487,14 +510,14 @@ async function uploadFileToTelegram(context, fullId, metadata, fileExt, fileName
 
     const defaultType = { 'url': 'sendDocument', 'type': 'document' };
 
-    let sendFunction = Object.keys(fileTypeMap).find(key => fileType.startsWith(key))
-        ? fileTypeMap[Object.keys(fileTypeMap).find(key => fileType.startsWith(key))]
-        : defaultType;
+    const mimeType = normalizeMimeType(fileType);
+    const sendType = Object.keys(fileTypeMap).find(key => mimeType.startsWith(key));
+    let sendFunction = sendType ? fileTypeMap[sendType] : defaultType;
 
     // GIF ICO 等发送接口特殊处理
-    if (fileType === 'image/gif' || fileType === 'image/webp' || fileExt === 'gif' || fileExt === 'webp') {
+    if (mimeType === 'image/gif' || mimeType === 'image/webp' || fileExt === 'gif' || fileExt === 'webp') {
         sendFunction = { 'url': 'sendAnimation', 'type': 'animation' };
-    } else if (fileType === 'image/svg+xml' || fileType === 'image/x-icon') {
+    } else if (mimeType === 'image/svg+xml' || mimeType === 'image/x-icon') {
         sendFunction = { 'url': 'sendDocument', 'type': 'document' };
     }
 
@@ -809,7 +832,7 @@ async function uploadFileToWebDAV(context, fullId, metadata, returnLink) {
 
     try {
         const webdavAPI = new WebDAVAPI(webdavChannel);
-        await webdavAPI.putFile(fullId, file, file.type || metadata.FileType || 'application/octet-stream');
+        await webdavAPI.putFile(fullId, file, metadata.FileType);
 
         metadata.Channel = "WebDAV";
         metadata.ChannelName = webdavChannel.name || "WebDAV_env";

@@ -1,11 +1,12 @@
 import { createS3Client } from '../utils/storage/s3Client.js';
 /* ======= 客户端分块上传处理 ======= */
-import { createResponse, selectConsistentChannel, getUploadIp, getIPAddress, buildUniqueFileId, endUpload } from './uploadTools';
+import { createResponse, checkUploadFormat, selectConsistentChannel, getUploadIp, getIPAddress, buildUniqueFileId, endUpload } from './uploadTools';
 import { TelegramAPI } from '../utils/storage/telegramAPI';
 import { DiscordAPI } from '../utils/storage/discordAPI';
 import { CreateMultipartUploadCommand, UploadPartCommand, AbortMultipartUploadCommand } from "@aws-sdk/client-s3";
 import { getDatabase, checkDatabaseConfig } from '../utils/databaseAdapter.js';
 import { fetchPageConfig } from '../utils/sysConfig.js';
+import { resolveFileType } from '../utils/mimeTypes.js';
 
 // 初始化分块上传
 export async function initializeChunkedUpload(context) {
@@ -17,12 +18,15 @@ export async function initializeChunkedUpload(context) {
         const formdata = await request.formData();
 
         const originalFileName = formdata.get('originalFileName');
-        const originalFileType = formdata.get('originalFileType');
+        const originalFileType = resolveFileType(originalFileName, formdata.get('originalFileType'));
         const totalChunks = parseInt(formdata.get('totalChunks'));
 
         if (!originalFileName || !originalFileType || !totalChunks) {
             return createResponse('Error: Missing initialization parameters', { status: 400 });
         }
+
+        const formatError = checkUploadFormat(originalFileName, context.uploadConfig);
+        if (formatError) return formatError;
 
         // 生成唯一的 uploadId
         const timestamp = Date.now();
@@ -98,7 +102,7 @@ export async function handleChunkUpload(context) {
         const totalChunks = parseInt(formdata.get('totalChunks'));
         const uploadId = formdata.get('uploadId');
         const originalFileName = formdata.get('originalFileName');
-        const originalFileType = formdata.get('originalFileType');
+        const originalFileType = resolveFileType(originalFileName, formdata.get('originalFileType'));
 
         if (!chunk || chunkIndex === null || !totalChunks || !uploadId || !originalFileName || !originalFileType) {
             return createResponse('Error: Missing chunk upload parameters', { status: 400 });
@@ -118,6 +122,9 @@ export async function handleChunkUpload(context) {
             sessionInfo.totalChunks !== totalChunks) {
             return createResponse('Error: Session parameters mismatch', { status: 400 });
         }
+
+        const formatError = checkUploadFormat(sessionInfo.originalFileName, context.uploadConfig);
+        if (formatError) return formatError;
 
         // 检查会话是否过期
         if (Date.now() > sessionInfo.expiresAt) {
@@ -384,7 +391,9 @@ async function uploadSingleChunkToR2Multipart(context, chunkData, chunkIndex, to
         if (chunkIndex === 0) {
             finalFileId = await buildUniqueFileId(context, originalFileName, originalFileType);
 
-            const multipartUpload = await R2DataBase.createMultipartUpload(finalFileId);
+            const multipartUpload = await R2DataBase.createMultipartUpload(finalFileId, {
+                httpMetadata: { contentType: originalFileType },
+            });
             const multipartInfo = {
                 uploadId: multipartUpload.uploadId,
                 key: finalFileId
@@ -855,7 +864,7 @@ async function retrySingleChunk(context, chunk, uploadChannel, maxRetries = 5, r
 
         const chunkData = chunkRecord.value;
         const originalFileName = chunkRecord.metadata?.originalFileName || 'unknown';
-        const originalFileType = chunkRecord.metadata?.originalFileType || 'application/octet-stream';
+        const originalFileType = resolveFileType(originalFileName, chunkRecord.metadata?.originalFileType);
         const uploadId = chunkRecord.metadata?.uploadId;
         const totalChunks = chunkRecord.metadata?.totalChunks || 1;
 
@@ -1270,6 +1279,9 @@ export async function uploadLargeFileToTelegram(context, file, fullId, metadata,
         const responseBody = [{ 'src': returnLink }];
         if (urlPrefix) {
             responseBody[0].publicUrl = `${urlPrefix.replace(/\/+$/, '')}/${fullId}`;
+        }
+        if (metadata.ExpiresAt) {
+            responseBody[0].expiresAt = metadata.ExpiresAt;
         }
 
         return createResponse(
